@@ -7,9 +7,33 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 import tempfile
+import shutil
 from processor import process_folder, export_reports
 import config
 
+# ── Persistent file store ─────────────────────────────────────────────────────
+SAVED_DIR = Path("saved_files")
+SAVED_DIR.mkdir(exist_ok=True)
+
+
+def saved_files() -> list[Path]:
+    """Return sorted list of .xlsx / .xls files in the saved store."""
+    return sorted(SAVED_DIR.glob("*.xls*"))
+
+
+def save_uploaded(file) -> Path:
+    dest = SAVED_DIR / file.name
+    dest.write_bytes(file.getbuffer())
+    return dest
+
+
+def delete_saved(name: str):
+    target = SAVED_DIR / name
+    if target.exists():
+        target.unlink()
+
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Duty Chart Consolidator",
     page_icon="📋",
@@ -25,6 +49,7 @@ gives a **breakdown by period**, and a full **detailed duty list**.
 """
 )
 
+# ── Sidebar settings ──────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ Settings")
     st.markdown("**Hours per duty**")
@@ -37,36 +62,79 @@ with st.sidebar:
     st.markdown("**Supported file names**")
     st.code("SP-2026-END-SEM.xlsx\nSP-2026-MID-SEM.xlsx\nSem3_Mid_2025.xlsx")
 
-uploaded_files = st.file_uploader(
-    "Upload duty chart Excel files (.xlsx)",
-    type=["xlsx", "xls"],
-    accept_multiple_files=True,
-)
+# ── File manager ──────────────────────────────────────────────────────────────
+current_files = saved_files()
+file_count = len(current_files)
+expander_label = f"📁 Input Files — {file_count} file(s) ready" if file_count else "📁 Input Files — no files loaded"
 
-if uploaded_files:
-    st.success(f"{len(uploaded_files)} file(s) uploaded")
+with st.expander(expander_label, expanded=file_count == 0):
 
-    if st.button("🚀 Process All Files", type="primary"):
-        with st.spinner("Reading and consolidating duties..."):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmp_path = Path(tmpdir)
-                for f in uploaded_files:
-                    (tmp_path / f.name).write_bytes(f.getbuffer())
+    # -- Upload area (uses a resettable key so the widget clears after saving) -
+    if "uploader_key" not in st.session_state:
+        st.session_state["uploader_key"] = 0
 
-                try:
-                    detailed, summary, ranking = process_folder(str(tmp_path))
-                    st.session_state["detailed"] = detailed
-                    st.session_state["summary"] = summary
-                    st.session_state["ranking"] = ranking
-                    st.session_state["processed"] = True
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                    st.stop()
+    new_uploads = st.file_uploader(
+        "Add / replace duty chart Excel files (.xlsx)",
+        type=["xlsx", "xls"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state['uploader_key']}",
+    )
 
+    if new_uploads:
+        for f in new_uploads:
+            save_uploaded(f)
+        st.session_state["uploader_key"] += 1   # clears the widget on next render
+        st.rerun()
+
+    # -- Saved file list with delete buttons -----------------------------------
+    if current_files:
+        st.markdown(f"**{file_count} file(s) ready to process:**")
+
+        header = st.columns([5, 1.5, 1])
+        header[0].caption("File name")
+        header[1].caption("Size")
+        header[2].caption("Remove")
+
+        for fp in current_files:
+            col_name, col_size, col_del = st.columns([5, 1.5, 1])
+            size_kb = fp.stat().st_size / 1024
+            col_name.write(f"📄 {fp.name}")
+            col_size.caption(f"{size_kb:.1f} KB")
+            if col_del.button(
+                "🗑️",
+                key=f"del_{fp.name}",
+                help=f"Remove {fp.name}",
+                on_click=delete_saved,
+                args=(fp.name,),
+            ):
+                st.rerun()
+    else:
+        st.info("👆 Upload your duty Excel files above to get started.")
+
+# ── Process button ────────────────────────────────────────────────────────────
+st.markdown("")
+can_process = len(saved_files()) > 0
+if st.button("🚀 Process All Files", type="primary", disabled=not can_process):
+    with st.spinner("Reading and consolidating duties..."):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            for fp in saved_files():
+                shutil.copy2(fp, tmp_path / fp.name)
+            try:
+                detailed, summary, ranking = process_folder(str(tmp_path))
+                st.session_state["detailed"] = detailed
+                st.session_state["summary"] = summary
+                st.session_state["ranking"] = ranking
+                st.session_state["processed"] = True
+            except Exception as e:
+                st.error(f"Error: {e}")
+                st.stop()
+
+# ── Results ───────────────────────────────────────────────────────────────────
 if st.session_state.get("processed"):
     detailed = st.session_state["detailed"]
-    summary = st.session_state["summary"]
-    ranking = st.session_state["ranking"]
+    summary  = st.session_state["summary"]
+    ranking  = st.session_state["ranking"]
 
     st.markdown("---")
     st.header("📊 Results")
@@ -111,10 +179,14 @@ if st.session_state.get("processed"):
         if selected_exam != "All":
             filtered = filtered[filtered["ExamType"] == selected_exam]
 
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total Duties (filtered)", len(filtered))
-        m2.metric("Total Hours (filtered)", f"{int(filtered['Hours'].sum())} hrs")
-        m3.caption(f"Showing {len(filtered)} of {len(detailed)} records")
+        m1, m2, m3, m4 = st.columns(4)
+        first_half  = filtered[filtered["Session"] == "First Half"]
+        second_half = filtered[filtered["Session"] == "Second Half"]
+        m1.metric("Total Duties", len(filtered))
+        m2.metric("Total Hours", f"{int(filtered['Hours'].sum())} hrs")
+        m3.metric("First Half Duties", len(first_half))
+        m4.metric("Second Half Duties", len(second_half))
+        st.caption(f"Showing {len(filtered)} of {len(detailed)} records")
 
         st.dataframe(filtered, use_container_width=True, height=500)
 
@@ -129,9 +201,8 @@ if st.session_state.get("processed"):
             file_name="Duty_Consolidation_Report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
-else:
-    st.info("👆 Upload your duty Excel files and click **Process All Files**.")
 
+# ── Supported formats help ────────────────────────────────────────────────────
 with st.expander("ℹ️ Supported formats"):
     st.markdown(
         """
